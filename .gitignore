@@ -10,3 +10,6 @@ documentation/
 tsconfig.tsbuildinfo
 junit-results/
 *.log
+
+external-servers.json
+out/

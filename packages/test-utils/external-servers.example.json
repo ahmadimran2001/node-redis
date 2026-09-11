@@ -1,0 +1,18 @@
+{
+  "server": {
+    "host": "192.168.1.20",
+    "port": 6379,
+    "username": null,
+    "password": null,
+    "RESP": 2
+  },
+  "cluster": {
+    "nodes": [
+      { "host": "192.168.1.10", "port": 6379 },
+      { "host": "192.168.1.11", "port": 6379 }
+    ],
+    "username": null,
+    "password": null,
+    "RESP": 2
+  }
+}

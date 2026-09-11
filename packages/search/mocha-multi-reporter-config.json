@@ -1,5 +1,5 @@
 {
-  "reporterEnabled": "spec, mocha-junit-reporter",
+  "reporterEnabled": "spec, mocha-junit-reporter, ../../packages/test-utils/lib/external-results-reporter",
   "mochaJunitReporterReporterOptions": {
     "mochaFile": "../../junit-results/search.xml",
     "toConsole": false,

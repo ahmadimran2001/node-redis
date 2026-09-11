@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { setTimeout } from 'node:timers/promises';
 import testUtils, { GLOBAL, MATH_FUNCTION } from '../test-utils';
+import { isExternalModeEnabled } from '@redis/test-utils/lib/external-config';
 import { RESP_TYPES } from '../RESP/decoder';
 import { ScanIteratorInterruptedError, WatchError } from "../errors";
 import { RedisSentinelConfig, SentinelFramework } from "./test-util";
@@ -781,6 +782,7 @@ describe('legacy tests', () => {
 
     beforeEach(async function () {
       this.timeout(15000);
+      if (isExternalModeEnabled()) return this.skip();
 
       last = Date.now();
 
@@ -806,6 +808,7 @@ describe('legacy tests', () => {
 
     afterEach(async function () {
       this.timeout(60000);
+      if (isExternalModeEnabled()) return;
       // avoid errors in afterEach that end testing
       if (sentinel !== undefined) {
         sentinel.on('error', () => { });
@@ -1851,6 +1854,7 @@ describe('legacy tests', () => {
 
     beforeEach(async function () {
       this.timeout(60000);
+      if (isExternalModeEnabled()) return this.skip();
       await frame.spawnRedisSentinel();
       await frame.getAllRunning();
       await steadyState(frame);
@@ -1858,6 +1862,7 @@ describe('legacy tests', () => {
 
     afterEach(async function () {
       this.timeout(60000);
+      if (isExternalModeEnabled()) return;
       if (sentinel !== undefined) {
         sentinel.destroy();
         sentinel = undefined;

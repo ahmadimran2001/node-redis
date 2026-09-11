@@ -23,6 +23,7 @@ import {
 import { RedisNode } from '@redis/client/lib/sentinel/types'
 import { spawnRedisServer, spawnRedisCluster, spawnRedisSentinel, RedisServerDockerOptions, RedisServerDocker, spawnSentinelNode, spawnRedisServerDocker, spawnTlsRedisServer, TlsConfig, spawnProxiedRedisServer } from './dockers';
 import { isReCluster, loadREConnection } from './re-cluster';
+import { getExternalCluster, getExternalServer, isExternalModeEnabled, type ResolvedExternalServer } from './external-config';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 
@@ -242,6 +243,13 @@ export default class TestUtils {
     const defaultTag = isObjectFormat ? defaultVersion.tag : defaultVersion;
     const defaultVersionString = isObjectFormat ? defaultVersion.version : undefined;
 
+    if (isExternalModeEnabled()) {
+      return {
+        tag: defaultTag,
+        numbers: defaultVersionString ? TestUtils.parseVersionNumber(defaultVersionString) : [Infinity]
+      };
+    }
+
     const args = yargs(hideBin(process.argv))
       .option(tagArgumentName, {
         type: 'string',
@@ -392,6 +400,33 @@ export default class TestUtils {
     return 0;
   }
 
+  static #canUseExternal(
+    endpoint: { password?: string } | undefined,
+    serverArguments: Array<string>
+  ): boolean {
+    if (endpoint === undefined) return false;
+
+    const requiresPassword = serverArguments.some(argument => argument === '--requirepass' || argument.startsWith('--requirepass='));
+    return !requiresPassword || endpoint.password !== undefined;
+  }
+
+  static #externalClientOptions<T extends object>(
+    clientOptions: T | undefined,
+    server: ResolvedExternalServer
+  ): T {
+    return {
+      ...clientOptions,
+      ...(server.username !== undefined && { username: server.username }),
+      ...(server.password !== undefined && { password: server.password }),
+      ...(server.RESP !== undefined && { RESP: server.RESP }),
+      socket: {
+        ...(clientOptions as { socket?: object } | undefined)?.socket,
+        host: server.host,
+        port: server.port
+      }
+    } as T;
+  }
+
   testWithClient<
     M extends RedisModules = {},
     F extends RedisFunctions = {},
@@ -404,8 +439,9 @@ export default class TestUtils {
     options: ClientTestOptions<M, F, S, RESP, TYPE_MAPPING>
   ): void {
     const reCluster = isReCluster();
+    const external = isExternalModeEnabled();
     let dockerPromise: ReturnType<typeof spawnRedisServer>;
-    if (!reCluster && this.isVersionGreaterThan(options.minimumDockerVersion)) {
+    if (!reCluster && !external && this.isVersionGreaterThan(options.minimumDockerVersion)) {
       const dockerImage = this.#DOCKER_IMAGE;
       before(function () {
         this.timeout(30000);
@@ -417,29 +453,33 @@ export default class TestUtils {
 
     it(title, async function () {
       if (options.skipTest) return this.skip();
-      // Against a managed Redis Enterprise database there is no Docker server to spawn;
-      // build the client from the resolved RE endpoint instead.
-      if (!reCluster && !dockerPromise) return this.skip();
+      const externalServer = external ? getExternalServer() : undefined;
+      if (external && !TestUtils.#canUseExternal(externalServer, options.serverArguments)) {
+        return this.skip();
+      }
+      if (!reCluster && !external && !dockerPromise) return this.skip();
 
       const client = createClient(
-        reCluster
-          ? ({
-            ...options.clientOptions,
-            username: loadREConnection().username,
-            password: loadREConnection().password,
-            socket: {
-              ...options.clientOptions?.socket,
-              host: loadREConnection().host,
-              port: loadREConnection().port
+        externalServer
+          ? TestUtils.#externalClientOptions(options.clientOptions, externalServer)
+          : reCluster
+            ? ({
+              ...options.clientOptions,
+              username: loadREConnection().username,
+              password: loadREConnection().password,
+              socket: {
+                ...options.clientOptions?.socket,
+                host: loadREConnection().host,
+                port: loadREConnection().port
+              }
+            } as typeof options.clientOptions)
+            : {
+              ...options.clientOptions,
+              socket: {
+                ...options.clientOptions?.socket,
+                port: (await dockerPromise).port
+              }
             }
-          } as typeof options.clientOptions)
-          : {
-            ...options.clientOptions,
-            socket: {
-              ...options.clientOptions?.socket,
-              port: (await dockerPromise).port
-            }
-          }
       );
 
       if (options.disableClientSetup) {
@@ -452,7 +492,13 @@ export default class TestUtils {
         await client.flushAll();
         await fn(client);
       } finally {
-        if (client.isOpen) {
+        if (externalServer) {
+          try {
+            if (client.isOpen) await client.flushAll();
+          } finally {
+            client.destroy();
+          }
+        } else if (client.isOpen) {
           await client.flushAll();
           client.destroy();
         }
@@ -484,7 +530,7 @@ export default class TestUtils {
     options: TlsClientTestOptions<M, F, S, RESP, TYPE_MAPPING>,
   ): void {
     let dockerPromise: ReturnType<typeof spawnTlsRedisServer>;
-    if (this.isVersionGreaterThan(options.minimumDockerVersion)) {
+    if (!isExternalModeEnabled() && this.isVersionGreaterThan(options.minimumDockerVersion)) {
       const dockerImage = this.#DOCKER_IMAGE;
       before(function () {
         this.timeout(60000); // TLS setup takes longer
@@ -561,14 +607,16 @@ export default class TestUtils {
     }
   ) {
     let spawnPromise: ReturnType<typeof spawnProxiedRedisServer>;
-    before(function () {
-      this.timeout(30000);
-      spawnPromise = spawnProxiedRedisServer({
-        nOfProxies: options.numberOfMasters ?? 3,
-        defaultInterceptors: ["cluster", "hitless", "logger"],
-        freshContainer: options.freshContainer,
+    if (!isExternalModeEnabled()) {
+      before(function () {
+        this.timeout(30000);
+        spawnPromise = spawnProxiedRedisServer({
+          nOfProxies: options.numberOfMasters ?? 3,
+          defaultInterceptors: ["cluster", "hitless", "logger"],
+          freshContainer: options.freshContainer,
+        });
       });
-    });
+    }
 
     it(title, async function () {
       if (!spawnPromise) return this.skip();
@@ -674,9 +722,7 @@ export default class TestUtils {
       password = options.serverArguments[passIndex];
     }
 
-    // Sentinel requires a local master/replica/sentinel topology that a single managed
-    // Redis Enterprise database cannot provide, so skip these tests on RE.
-    if (!isReCluster() && this.isVersionGreaterThan(options.minimumDockerVersion)) {
+    if (!isReCluster() && !isExternalModeEnabled() && this.isVersionGreaterThan(options.minimumDockerVersion)) {
       const dockerImage = this.#DOCKER_IMAGE;
       before(function () {
         this.timeout(30000);
@@ -789,8 +835,9 @@ export default class TestUtils {
     options: ClientPoolTestOptions<M, F, S, RESP, TYPE_MAPPING>
   ): void {
     const reCluster = isReCluster();
+    const external = isExternalModeEnabled();
     let dockerPromise: ReturnType<typeof spawnRedisServer>;
-    if (!reCluster && this.isVersionGreaterThan(options.minimumDockerVersion)) {
+    if (!reCluster && !external && this.isVersionGreaterThan(options.minimumDockerVersion)) {
       const dockerImage = this.#DOCKER_IMAGE;
       before(function () {
         this.timeout(30000);
@@ -802,27 +849,33 @@ export default class TestUtils {
 
     it(title, async function () {
       if (options.skipTest) return this.skip();
-      if (!reCluster && !dockerPromise) return this.skip();
+      const externalServer = external ? getExternalServer() : undefined;
+      if (external && !TestUtils.#canUseExternal(externalServer, options.serverArguments)) {
+        return this.skip();
+      }
+      if (!reCluster && !external && !dockerPromise) return this.skip();
 
       const pool = createClientPool(
-        reCluster
-          ? ({
-            ...options.clientOptions,
-            username: loadREConnection().username,
-            password: loadREConnection().password,
-            socket: {
-              ...options.clientOptions?.socket,
-              host: loadREConnection().host,
-              port: loadREConnection().port
-            }
-          } as typeof options.clientOptions)
-          : {
-            ...options.clientOptions,
-            socket: {
-              ...options.clientOptions?.socket,
-              port: (await dockerPromise).port
-            }
-          },
+        externalServer
+          ? TestUtils.#externalClientOptions(options.clientOptions, externalServer)
+          : reCluster
+            ? ({
+              ...options.clientOptions,
+              username: loadREConnection().username,
+              password: loadREConnection().password,
+              socket: {
+                ...options.clientOptions?.socket,
+                host: loadREConnection().host,
+                port: loadREConnection().port
+              }
+            } as typeof options.clientOptions)
+            : {
+              ...options.clientOptions,
+              socket: {
+                ...options.clientOptions?.socket,
+                port: (await dockerPromise).port
+              }
+            },
         options.poolOptions);
 
       await pool.connect();
@@ -831,7 +884,13 @@ export default class TestUtils {
         await pool.flushAll();
         await fn(pool);
       } finally {
-        if (pool.isOpen) {
+        if (externalServer) {
+          try {
+            if (pool.isOpen) await pool.flushAll();
+          } finally {
+            pool.destroy();
+          }
+        } else if (pool.isOpen) {
           await pool.flushAll();
           pool.destroy();
         }
@@ -868,10 +927,9 @@ export default class TestUtils {
     fn: (cluster: RedisClusterType<M, F, S, RESP, TYPE_MAPPING/*, POLICIES*/>) => unknown,
     options: ClusterTestOptions<M, F, S, RESP, TYPE_MAPPING/*, POLICIES*/>
   ): void {
-    // A managed Redis Enterprise database is not an OSS cluster / sentinel topology,
-    // so leave dockersPromise unset and let the test skip itself below.
+    const external = isExternalModeEnabled();
     let dockersPromise: ReturnType<typeof spawnRedisCluster>;
-    if (!isReCluster() && this.isVersionGreaterThan(options.minimumDockerVersion)) {
+    if (!isReCluster() && !external && this.isVersionGreaterThan(options.minimumDockerVersion)) {
       const dockerImage = this.#DOCKER_IMAGE;
       before(function () {
         this.timeout(30000);
@@ -889,21 +947,40 @@ export default class TestUtils {
     it(title, async function () {
       if (options.testTimeout) this.timeout(options.testTimeout);
       if (options.skipTest) return this.skip();
-      if (!dockersPromise) return this.skip();
-      const RESP = (options.clusterConfiguration?.RESP ?? DEFAULT_RESP) as RESP;
+
+      const externalCluster = external ? getExternalCluster() : undefined;
+      if (external && (
+        (options.numberOfReplicas ?? 0) > 0 ||
+        !TestUtils.#canUseExternal(externalCluster, options.serverArguments)
+      )) {
+        return this.skip();
+      }
+      if (!external && !dockersPromise) return this.skip();
+
+      const RESP = (externalCluster?.RESP ?? options.clusterConfiguration?.RESP ?? DEFAULT_RESP) as RESP;
       const { RESP: _RESP, ...clusterConfiguration } = options.clusterConfiguration ?? {};
 
-      const dockers = await dockersPromise,
-        cluster = createCluster({
-          rootNodes: dockers.map(({ port }) => ({
-            socket: {
-              port
-            }
-          })),
-          RESP,
-          minimizeConnections: options.clusterConfiguration?.minimizeConnections ?? true,
-          ...clusterConfiguration
-        }) as RedisClusterType<M, F, S, RESP, TYPE_MAPPING>;
+      const rootNodes = externalCluster
+        ? externalCluster.nodes.map(({ host, port }) => ({
+          socket: { host, port },
+          ...(externalCluster.username !== undefined && { username: externalCluster.username }),
+          ...(externalCluster.password !== undefined && { password: externalCluster.password })
+        }))
+        : (await dockersPromise).map(({ port }) => ({ socket: { port } }));
+
+      const cluster = createCluster({
+        rootNodes,
+        RESP,
+        minimizeConnections: options.clusterConfiguration?.minimizeConnections ?? true,
+        ...clusterConfiguration,
+        ...(externalCluster && {
+          defaults: {
+            ...clusterConfiguration.defaults,
+            ...(externalCluster.username !== undefined && { username: externalCluster.username }),
+            ...(externalCluster.password !== undefined && { password: externalCluster.password })
+          }
+        })
+      }) as RedisClusterType<M, F, S, RESP, TYPE_MAPPING>;
 
       if(options.disableClusterSetup) {
         return fn(cluster);
@@ -915,8 +992,16 @@ export default class TestUtils {
         await TestUtils.#clusterFlushAll(cluster);
         await fn(cluster);
       } finally {
-        await TestUtils.#clusterFlushAll(cluster);
-        cluster.destroy();
+        if (externalCluster) {
+          try {
+            await TestUtils.#clusterFlushAll(cluster);
+          } finally {
+            cluster.destroy();
+          }
+        } else {
+          await TestUtils.#clusterFlushAll(cluster);
+          cluster.destroy();
+        }
       }
     });
   }

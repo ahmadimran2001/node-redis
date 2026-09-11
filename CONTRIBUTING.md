@@ -53,6 +53,64 @@ Note that the test suite assumes that [`docker`](https://www.docker.com/) is ins
 
 The test suite starts its Redis containers with `--network host`, which requires host networking support. On macOS and Windows this needs Docker Desktop 4.34 or newer with host networking enabled: **Settings → Resources → Network → Enable host networking**. Without it, the spawned containers are not reachable from the host and the dockerized tests will hang or time out.
 
+#### Running against an external Redis server
+
+The suite can run against Redis servers that are already running instead of spawning its own
+in Docker — useful for validating the client against a staging deployment, a managed service,
+or any server speaking the Redis protocol. Describe the servers in a JSON file
+(see [`packages/test-utils/external-servers.example.json`](packages/test-utils/external-servers.example.json)):
+
+```json
+{
+  "server": {
+    "host": "192.168.1.20",
+    "port": 6379,
+    "username": null,
+    "password": null,
+    "RESP": 2
+  },
+  "cluster": {
+    "nodes": [
+      { "host": "192.168.1.10", "port": 6379 },
+      { "host": "192.168.1.11", "port": 6379 }
+    ],
+    "username": null,
+    "password": null,
+    "RESP": 2
+  }
+}
+```
+
+Then point the suite at it, either with a command-line argument:
+
+```bash
+npm test -w @redis/client -- --redis-external-config=./external-servers.json
+```
+
+or with the `REDIS_EXTERNAL_CONFIG` environment variable. Docker is not used at all in this
+mode; without the argument or variable, nothing changes and the suite spawns its own
+containers as usual.
+
+Both sections are optional and describe different things. `server` is a single standalone
+Redis, used by the client and pool tests. `cluster` is a Redis cluster, used by the cluster
+tests — a standalone client aimed at one cluster node would be answered with `MOVED` for
+most keys, so the two cannot share one entry. Fill in whichever you have; the tests belonging
+to a missing section are skipped.
+
+`port` defaults to `6379`. `RESP` is optional and, when set, overrides the protocol version
+the specs request — pin it to `2` for servers that do not implement RESP3, since the client
+otherwise sends `HELLO 3` during the handshake and fails to connect at all.
+
+When the run starts, the suite prints what it will target and every category it is skipping,
+with the reason. Sentinel, TLS and proxied-cluster tests always skip in this mode: they
+depend on containers the suite builds and controls. Cluster tests that need replicas, and
+tests that need a password-protected server, skip unless the config can satisfy them.
+
+A server implementing only part of the Redis command set will report failures for the
+commands it lacks. Narrow the run with mocha's own `spec` / `ignore` options rather than
+changing any code — [`packages/client/.mocharc-re.cjs`](packages/client/.mocharc-re.cjs) is
+an existing example of that pattern.
+
 ### Submitting Code for Review
 
 The bigger the pull request, the longer it will take to review and merge. Where possible try to break down large pull requests into smaller chunks that are easier to review and merge. It is also always helpful to have some context for your pull request. What was the purpose? Why does it matter to you? What problem are you trying to solve? Tag in any relevant issues.

@@ -413,6 +413,8 @@ See [Supported Redis Versions](https://github.com/redis/node-redis/blob/master/S
 
 If you'd like to contribute, check out the [contributing guide](https://github.com/redis/node-redis/blob/master/CONTRIBUTING.md).
 
+The test suite uses Docker by default and can also target an existing Redis deployment. See the [external-server testing instructions](./CONTRIBUTING.md#running-against-an-external-redis-server).
+
 Thank you to all the people who already contributed to Node Redis!
 
 [![Contributors](https://contrib.rocks/image?repo=redis/node-redis)](https://github.com/redis/node-redis/graphs/contributors)
